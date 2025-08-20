@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: m300-websocket-simulator
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python websocket_app.py
+    envVars:
+      - key: MODE
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        fromParam: PORT

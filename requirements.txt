@@ -1,2 +1,4 @@
-websockets
-pyModbusTCP
+websockets>=11.0.0
+pyModbusTCP>=0.2.0
+aiohttp>=3.9.0
+aiohttp-cors>=0.7.0

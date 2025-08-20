@@ -9,6 +9,8 @@ import websockets
 import logging
 from datetime import datetime
 from pyModbusTCP.server import ModbusServer
+from aiohttp import web, WSMsgType
+import aiohttp_cors
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -37,6 +39,7 @@ class M300WebSocketSimulator:
         self.connected_clients = {}  # Changed to dict for better tracking
         self.loop = None
         self.client_counter = 0
+        self.app = None  # HTTP app instance
         
         # Setup mock data generation
         self.setup_mock_data()
@@ -100,7 +103,7 @@ class M300WebSocketSimulator:
                 if self.connected_clients and self.loop:
                     try:
                         asyncio.run_coroutine_threadsafe(
-                            self.broadcast_to_clients(message), 
+                            self.broadcast_to_http_ws_clients(message), 
                             self.loop
                         ).result(timeout=1.0)
                     except Exception as e:
@@ -130,6 +133,29 @@ class M300WebSocketSimulator:
                 disconnected_clients.append(client_id)
             except Exception as e:
                 logger.error(f"Error sending to client {client_id}: {e}")
+                disconnected_clients.append(client_id)
+        
+        # Remove disconnected clients
+        for client_id in disconnected_clients:
+            await self.remove_client(client_id)
+    
+    async def broadcast_to_http_ws_clients(self, message):
+        """Broadcast to HTTP WebSocket clients"""
+        if not self.connected_clients:
+            return
+            
+        message_str = json.dumps(message)
+        disconnected_clients = []
+        
+        for client_id, client_conn in list(self.connected_clients.items()):
+            try:
+                if hasattr(client_conn.websocket, 'send'):
+                    await client_conn.websocket.send(message_str)
+                else:
+                    await client_conn.websocket.send_str(message_str)
+                client_conn.update_activity()
+            except Exception as e:
+                logger.error(f"Error sending to HTTP-WS client {client_id}: {e}")
                 disconnected_clients.append(client_id)
         
         # Remove disconnected clients
@@ -323,13 +349,210 @@ class M300WebSocketSimulator:
             except Exception as e:
                 logger.error(f"Error in periodic client check: {e}")
     
+    async def health_check(self, request):
+        """HTTP health check endpoint"""
+        return web.json_response({
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "service": "M300 WebSocket Simulator",
+            "version": "1.0.0",
+            "connected_clients": len(self.connected_clients),
+            "data_points": len(self.sensor_data),
+            "history_records": len(self.data_history)
+        })
+    
+    async def websocket_handler(self, request):
+        """HTTP to WebSocket upgrade handler"""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        
+        # Convert aiohttp WebSocket to websockets-like interface
+        client_id = None
+        client_conn = None
+        
+        try:
+            # Add client to tracking
+            self.client_counter += 1
+            client_id = f"client_{self.client_counter}"
+            
+            # Create a mock websocket object for compatibility
+            mock_websocket = type('MockWebSocket', (), {
+                'remote_address': (request.remote, 0),
+                'send': ws.send_str,
+                'close': ws.close
+            })()
+            
+            client_conn = ClientConnection(mock_websocket, client_id)
+            self.connected_clients[client_id] = client_conn
+            
+            logger.info(f"New HTTP-WS client connected: {client_id} from {request.remote} - Total clients: {len(self.connected_clients)}")
+            
+            # Send initial data
+            initial_message = {
+                "type": "initial_data",
+                "timestamp": datetime.now().isoformat(),
+                "client_id": client_id,
+                "sensors": self.sensor_data,
+                "system": {
+                    "gateway": "online",
+                    "sensors": {
+                        "digital": "active" if 'FLOW' in self.sensor_data else "inactive",
+                        "modbus": "active" if 'pH' in self.sensor_data else "inactive"
+                    },
+                    "data_points": len(self.sensor_data),
+                    "history_records": len(self.data_history),
+                    "connected_clients": len(self.connected_clients)
+                },
+                "status": "connected"
+            }
+            
+            await ws.send_str(json.dumps(initial_message))
+            logger.info(f"Sent initial data to {client_id}")
+            
+            # Handle messages
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                        await self.handle_http_ws_message(ws, data, client_conn)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON decode error from {client_id}: {e}")
+                        error_response = {
+                            "type": "error",
+                            "message": "Invalid JSON format",
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        await ws.send_str(json.dumps(error_response))
+                elif msg.type == WSMsgType.ERROR:
+                    logger.error(f"WebSocket error from {client_id}: {ws.exception()}")
+                    break
+                elif msg.type == WSMsgType.CLOSE:
+                    logger.info(f"WebSocket closed for {client_id}")
+                    break
+                    
+        except Exception as e:
+            logger.error(f"Error in WebSocket handler for {client_id}: {e}")
+        finally:
+            # Cleanup
+            if client_id and client_id in self.connected_clients:
+                await self.remove_client(client_id)
+                
+        return ws
+    
+    async def handle_http_ws_message(self, ws, data, client_conn):
+        """Handle messages from HTTP WebSocket clients"""
+        message_type = data.get("type", "unknown")
+        client_conn.update_activity()
+        
+        try:
+            if message_type == "get_sensors":
+                response = {
+                    "type": "sensor_data",
+                    "timestamp": datetime.now().isoformat(),
+                    "sensors": self.sensor_data,
+                    "status": "active"
+                }
+                await ws.send_str(json.dumps(response))
+                
+            elif message_type == "get_status":
+                response = {
+                    "type": "system_status",
+                    "timestamp": datetime.now().isoformat(),
+                    "system": {
+                        "gateway": "online",
+                        "sensors": {
+                            "digital": "active" if 'FLOW' in self.sensor_data else "inactive",
+                            "modbus": "active" if 'pH' in self.sensor_data else "inactive"
+                        },
+                        "data_points": len(self.sensor_data),
+                        "history_records": len(self.data_history),
+                        "connected_clients": len(self.connected_clients)
+                    }
+                }
+                await ws.send_str(json.dumps(response))
+                
+            elif message_type == "get_history":
+                limit = data.get("limit", 100)
+                response = {
+                    "type": "history_data",
+                    "timestamp": datetime.now().isoformat(),
+                    "history": self.data_history[-limit:],
+                    "total_records": len(self.data_history),
+                    "limit": limit
+                }
+                await ws.send_str(json.dumps(response))
+                
+            elif message_type == "clear_history":
+                self.data_history.clear()
+                response = {
+                    "type": "history_cleared",
+                    "message": "History cleared successfully",
+                    "timestamp": datetime.now().isoformat()
+                }
+                await ws.send_str(json.dumps(response))
+                
+            elif message_type == "ping":
+                response = {
+                    "type": "pong",
+                    "timestamp": datetime.now().isoformat(),
+                    "client_id": client_conn.client_id
+                }
+                await ws.send_str(json.dumps(response))
+                
+            elif message_type == "get_client_info":
+                response = {
+                    "type": "client_info",
+                    "timestamp": datetime.now().isoformat(),
+                    "client_id": client_conn.client_id,
+                    "connected_since": client_conn.connected_at.isoformat(),
+                    "message_count": client_conn.message_count,
+                    "last_activity": client_conn.last_ping.isoformat()
+                }
+                await ws.send_str(json.dumps(response))
+                
+            else:
+                error_response = {
+                    "type": "error",
+                    "message": f"Unknown message type: {message_type}",
+                    "timestamp": datetime.now().isoformat()
+                }
+                await ws.send_str(json.dumps(error_response))
+                
+        except Exception as e:
+            logger.error(f"Error handling HTTP-WS message type {message_type}: {e}")
+    
+    def setup_http_app(self):
+        """Setup HTTP application with WebSocket support"""
+        self.app = web.Application()
+        
+        # Add CORS support
+        cors = aiohttp_cors.setup(self.app, defaults={
+            "*": aiohttp_cors.ResourceOptions(
+                allow_credentials=True,
+                expose_headers="*",
+                allow_headers="*",
+                allow_methods="*"
+            )
+        })
+        
+        # Add routes
+        self.app.router.add_get('/', self.health_check)
+        self.app.router.add_get('/health', self.health_check)
+        self.app.router.add_get('/ws', self.websocket_handler)
+        self.app.router.add_get('/websocket', self.websocket_handler)
+        
+        # Add CORS to all routes
+        for route in list(self.app.router.routes()):
+            cors.add(route)
+    
     async def start_server(self, host='0.0.0.0', port=None):
-        """Start WebSocket server"""
+        """Start combined HTTP and WebSocket server"""
         if port is None:
             port = int(os.environ.get('PORT', 8765))
         
         print(f"🚀 M300 WebSocket Simulator starting...")
-        print(f"🔌 WebSocket Server: ws://{host}:{port}")
+        print(f"🌐 HTTP Server: http://{host}:{port}")
+        print(f"🔌 WebSocket Endpoint: ws://{host}:{port}/ws")
         print(f"📱 Ready for Flutter app connections")
         print(f"🔄 Mock data generation: Active")
         print(f"📊 Message types supported:")
@@ -344,35 +567,38 @@ class M300WebSocketSimulator:
         # Store the event loop for broadcasting
         self.loop = asyncio.get_event_loop()
         
+        # Setup HTTP app with WebSocket support
+        self.setup_http_app()
+        
         # Start periodic client health check
         health_check_task = asyncio.create_task(self.periodic_client_check())
         
         try:
-            # Start WebSocket server
-            server = await websockets.serve(
-                self.handle_client, 
-                host, 
-                port,
-                ping_interval=20,
-                ping_timeout=10,
-                close_timeout=10,
-                max_size=1024*1024  # 1MB max message size
-            )
+            # Start HTTP server with WebSocket support
+            runner = web.AppRunner(self.app)
+            await runner.setup()
+            site = web.TCPSite(runner, host, port)
+            await site.start()
             
-            print(f"✅ WebSocket server started successfully!")
-            print(f"💡 Connect your Flutter app to: ws://{host}:{port}")
-            print(f"🔍 Server info: ping_interval=20s, ping_timeout=10s")
-            print(f"📡 Testing with Postman: Create new WebSocket request to ws://{host}:{port}")
+            print(f"✅ HTTP/WebSocket server started successfully!")
+            print(f"💡 Connect your Flutter app to: ws://{host}:{port}/ws")
+            print(f"🌐 Health check available at: http://{host}:{port}/health")
+            print(f"📡 Testing with Postman:")
+            print(f"   - HTTP: GET http://{host}:{port}/health")
+            print(f"   - WebSocket: ws://{host}:{port}/ws")
             print(f"📈 Client health checks running every 30 seconds")
             
             # Keep server running
-            await server.wait_closed()
+            while self.running:
+                await asyncio.sleep(1)
                 
         except Exception as e:
             logger.error(f"Server startup error: {e}")
             raise
         finally:
             health_check_task.cancel()
+            if hasattr(self, 'app') and self.app:
+                await runner.cleanup()
     
     def run(self, host='0.0.0.0', port=None):
         """Run the WebSocket server"""
